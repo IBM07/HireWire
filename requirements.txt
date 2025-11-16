@@ -1,0 +1,10 @@
+ollama
+requests 
+beautifulsoup4 
+mysql-connector-python 
+click
+selenium
+ollama
+flask
+streamlit
+flask-cors
