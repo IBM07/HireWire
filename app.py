@@ -23,12 +23,12 @@ def fetch_jobs_from_api(skills_query):
         return {"error": f"HTTPError: {e}"}
 
 st.set_page_config(
-    page_title="CareerCortex",
+    page_title="HireWire",
     page_icon="🚀",
     layout="wide"
 )
 
-st.title("🚀 CareerCortex")
+st.title("🚀 HireWire")
 st.write("Enter your skills. Our AI will find the jobs that *actually* match.")
 
 user_skills = st.text_input(
