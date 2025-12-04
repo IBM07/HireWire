@@ -1,33 +1,35 @@
-# --- 1. The Imports ---
-# We import Flask (the core framework) and key utilities.
-# - 'request': An object that holds all incoming data (like URLs, headers).
-# - 'jsonify': A function that correctly formats our Python dictionaries into
-#              a JSON response that browsers/apps can understand.
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import mysql.connector
 import json
+import math
+import re
+from difflib import SequenceMatcher
+from datetime import datetime, timedelta, date
+import hashlib
+import functools
+import urllib.parse
 
-# --- 2. The Application Instance ---
-# This 'app' object is the heart of our Flask application.
-# '__name__' tells Flask where to find other files (like templates),
-# but for an API, it's mostly boilerplate.
 app = Flask(__name__)
 CORS(app)
-# --- 3. The "Interview" Critical Concept: Database Connections ---
-# !! DO NOT DO THIS (The Junior Mistake) !!
-# db = mysql.connector.connect(...)
-# cursor = db.cursor()
-#
-# Why? A web server handles *many requests at once* (multithreading). If two
-# requests try to use the *same* 'cursor' at the *same* time, your app will
-# crash or corrupt data.
-#
-# THE SENIOR SOLUTION:
-# You MUST create a *fresh* database connection for *every single API request*
-# and close it immediately after. This is thread-safe and stable.
+
+# Configuration
+DEFAULT_PAGE_SIZE = 20
+MAX_PAGE_SIZE = 100
+CACHE_DURATION = 300 
+
+# Simple in-memory cache
+cache_store = {}
+
+class DateTimeEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, (datetime, date)):
+            return obj.isoformat()
+        return super(DateTimeEncoder, self).default(obj)
+
+app.json_encoder = DateTimeEncoder
+
 def get_db_connection():
-    # This function creates a new, fresh connection every time it's called.
     return mysql.connector.connect(
         host="127.0.0.1",
         user="root",
@@ -35,9 +37,34 @@ def get_db_connection():
         database="job_agent"
     )
 
-# --- 4. The "Smart Match" Logic ---
-# This is our "business logic." It's good practice to keep this
-# separate from the API routing. This code is perfect.
+def generate_cache_key(endpoint, filters):
+    key_data = f"{endpoint}:{json.dumps(filters, sort_keys=True, default=str)}"
+    return hashlib.md5(key_data.encode()).hexdigest()
+
+def cache_response(timeout=CACHE_DURATION):
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            filters = dict(request.args)
+            cache_key = generate_cache_key(request.endpoint, filters)
+            
+            if cache_key in cache_store:
+                cache_data, timestamp = cache_store[cache_key]
+                if datetime.now() - timestamp < timedelta(seconds=timeout):
+                    return jsonify(cache_data)
+            
+            result = func(*args, **kwargs)
+            if hasattr(result, 'status_code') and result.status_code == 200:
+                cache_store[cache_key] = (result.get_json(), datetime.now())
+            return result
+        return wrapper
+    return decorator
+
+def clear_cache_for_endpoint(endpoint):
+    keys_to_remove = [key for key in cache_store.keys() if key.startswith(endpoint)]
+    for key in keys_to_remove:
+        del cache_store[key]
+
 def calculate_match_score(job_skills, user_skills):
     if not job_skills or not user_skills:
         return 0, []
@@ -50,90 +77,217 @@ def calculate_match_score(job_skills, user_skills):
 
     matches = job_set.intersection(user_set)
     score = int((len(matches) / len(job_set)) * 100)
-    
     missing = list(job_set - user_set)
     return score, missing
 
-# --- 5. The API Endpoints (The "Routes") ---
-#
-# This is an "endpoint." The '@app.route' is a "decorator."
-# It's a special Python feature that "wraps" our function.
-# This tells Flask: "If anyone sends a GET request to 'http://.../jobs',
-# run the 'search_jobs' function."
+def serialize_date(dt):
+    if isinstance(dt, (datetime, date)):
+        return dt.isoformat()
+    return dt
 
-@app.route("/jobs", methods=["GET"])
-def search_jobs():
+def build_search_query(filters, include_pagination=False):
+    # We fetch ALL jobs first to sort them in Python by Match Score
+    base_query = "SELECT * FROM job_openings WHERE 1=1"
     
-    # 5a. Get User Input:
-    # We use the 'request' object to get query parameters from the URL.
-    # e.g., /jobs?skills=python,docker
-    # 'request.args.get()' is the standard way to do this.
-    skills = request.args.get('skills') # Gets 'python,docker' as a string
-    limit = request.args.get('limit', default=50, type=int) # With a default
+    conditions = []
+    parameters = []
+    
+    if filters.get('search'):
+        search_term = filters['search']
+        conditions.append("""
+            (MATCH(job_title, raw_description, company, location_scraped) 
+            AGAINST (%s IN NATURAL LANGUAGE MODE) 
+            OR LOWER(job_title) LIKE LOWER(%s) 
+            OR LOWER(company) LIKE LOWER(%s))
+        """)
+        parameters.extend([search_term, f"%{search_term}%", f"%{search_term}%"])
+    
+    if filters.get('location'):
+        conditions.append("LOWER(location_scraped) LIKE LOWER(%s)")
+        parameters.append(f"%{filters['location']}%")
+    
+    if filters.get('remote_only') == 'true':
+        conditions.append("is_remote = 1")
+    
+    if filters.get('company'):
+        conditions.append("LOWER(company) LIKE LOWER(%s)")
+        parameters.append(f"%{filters['company']}%")
+    
+    if filters.get('job_type'):
+        conditions.append("job_type = %s")
+        parameters.append(filters['job_type'])
+    
+    if conditions:
+        base_query += " AND " + " AND ".join(conditions)
+    
+    # Only use SQL limit if we are NOT sorting by Match Score
+    # But for simplicity and correctness of Match Score sorting, we fetch all first.
+    return base_query, parameters
 
-    # 5b. Database Logic (The "Safe Way"):
-    conn = None # Initialize to None
-    try:
-        # We call our function to get a *fresh* connection
-        conn = get_db_connection()
-        cursor = conn.cursor(dictionary=True)
-        
-        cursor.execute("SELECT * FROM job_openings WHERE is_extracted = TRUE ORDER BY created_at DESC")
-        jobs = cursor.fetchall()
-
-    except mysql.connector.Error as err:
-        # If the database fails, send a professional 500 error.
-        # Don't just let the app crash.
-        return jsonify({"error": f"Database Error: {err}"}), 500
-    finally:
-        if conn:
-            conn.close()
-
-    # Business Logic (The Smart Match):
-    results = []
-    user_skill_list = [s.strip().lower() for s in skills.split(',')] if skills else []
-
+def enhance_search_results(jobs, search_term=None, user_skills=None):
+    if not jobs: return []
+    
+    enhanced_jobs = []
+    
     for job in jobs:
-        try:
-            job_skills_list = json.loads(job['required_skills']) if job['required_skills'] else []
-        except json.JSONDecodeError:
-            job_skills_list = []
+        relevance_score = 0
         
-        match_score = 0
+        # Text Relevance
+        if search_term:
+            search_lower = search_term.lower()
+            fields = [
+                (job.get('job_title', ''), 5.0),
+                (job.get('company', ''), 3.0),
+                (job.get('location_scraped', ''), 2.0),
+            ]
+            for field, weight in fields:
+                if field and search_lower in field.lower():
+                    relevance_score += weight * 10
+        
+        # Skill Match
+        skill_match_score = 0
         missing_skills = []
-
-        if user_skill_list:
-            match_score, missing_skills = calculate_match_score(job_skills_list, user_skill_list)
-            if match_score == 0:
-                continue
-
-        results.append({
+        
+        if user_skills:
+            try:
+                raw_skills = job.get('required_skills')
+                if raw_skills:
+                    if isinstance(raw_skills, str):
+                        job_skills_list = json.loads(raw_skills)
+                    else:
+                        job_skills_list = raw_skills
+                else:
+                    job_skills_list = []
+                
+                skill_match_score, missing_skills = calculate_match_score(job_skills_list, user_skills)
+            except:
+                job_skills_list = []
+        
+        total_score = relevance_score + (skill_match_score * 2)
+        
+        enhanced_jobs.append({
             "id": job['id'],
             "title": job['job_title'],
             "company": job['company'],
             "location": job['location_scraped'],
             "is_remote": bool(job['is_remote']),
-            "match_score": f"{match_score}%",
+            "job_type": job.get('job_type', 'Not specified'),
+            "match_score": f"{skill_match_score}%",
+            "match_score_int": skill_match_score,
+            "relevance_score": total_score,
             "skills_missing": missing_skills,
-            "apply_url": job['job_url']
+            "apply_url": job['job_url'],
+            "posted_date": serialize_date(job.get('created_at')),
         })
+    
+    return enhanced_jobs
 
-    # 5d. Sorting and Filtering:
-    if user_skill_list:
-        results.sort(key=lambda x: int(x['match_score'].strip('%')), reverse=True)
+@app.route("/jobs", methods=["GET"])
+# REMOVED @cache_response to ensure sorting always works live
+def search_jobs():
+    filters = {
+        'skills': request.args.get('skills'),
+        'location': request.args.get('location'),
+        'remote_only': request.args.get('remote_only'),
+        'company': request.args.get('company'),
+        'job_type': request.args.get('job_type'),
+        'search': request.args.get('search'),
+        'sort': request.args.get('sort', 'match_desc'),
+        'page': max(1, int(request.args.get('page', 1))),
+        'per_page': min(int(request.args.get('per_page', DEFAULT_PAGE_SIZE)), MAX_PAGE_SIZE),
+        'min_score': request.args.get('min_score', default=0, type=int)
+    }
+    
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+    
+    # 1. Fetch ALL matching jobs
+    sql_query, query_params = build_search_query(filters)
+    cursor.execute(sql_query, query_params)
+    all_jobs = cursor.fetchall()
+    conn.close()
 
-    # 5e. The Return:
-    # We MUST use 'jsonify'.
-    # 'jsonify' does two things:
-    # 1. Converts our Python dict to a JSON string.
-    # 2. Sets the HTTP header 'Content-Type: application/json'
-    # An interviewer will know if you just 'return dict' (the junior way).
-    return jsonify({"total": len(results), "jobs": results[:limit]})
+    # 2. Score them all
+    user_skill_list = [s.strip().lower() for s in filters['skills'].split(',')] if filters['skills'] else []
+    enhanced_jobs = enhance_search_results(all_jobs, filters.get('search'), user_skill_list)
+    
+    # 3. Apply Min Score Filter
+    if filters['min_score'] > 0:
+        enhanced_jobs = [j for j in enhanced_jobs if j['match_score_int'] >= filters['min_score']]
+        
+    # 4. GLOBAL SORTING (Python Side)
+    sort_option = filters['sort']
+    
+    if sort_option == 'match_desc':
+        # Sort by Match Score (High -> Low), then Relevance
+        enhanced_jobs.sort(key=lambda x: (x['match_score_int'], x['relevance_score']), reverse=True)
+    elif sort_option == 'date':
+        enhanced_jobs.sort(key=lambda x: x['posted_date'], reverse=True)
+    elif sort_option == 'company':
+        enhanced_jobs.sort(key=lambda x: x['company'].lower())
+        
+    # 5. Pagination
+    total_count = len(enhanced_jobs)
+    total_pages = math.ceil(total_count / filters['per_page']) if total_count > 0 else 1
+    
+    start = (filters['page'] - 1) * filters['per_page']
+    end = start + filters['per_page']
+    paginated_jobs = enhanced_jobs[start:end]
 
-# --- 6. The "Entry Point" ---
-# This 'if' statement means this code only runs
-# if you execute this file directly (e.g., 'python api.py').
-# 'debug=True' is great for development (it auto-reloads)
-# but MUST be 'False' in production.
+    # Build Links
+    base_url = request.base_url
+    q_params = request.args.copy()
+    
+    response = {
+        "pagination": {
+            "current_page": filters['page'],
+            "per_page": filters['per_page'],
+            "total_jobs": total_count,
+            "total_pages": total_pages,
+            "has_next": filters['page'] < total_pages,
+            "has_prev": filters['page'] > 1
+        },
+        "jobs": paginated_jobs
+    }
+    
+    return jsonify(response)
+
+# --- Other endpoints remain cached for performance ---
+
+@app.route("/cache/clear", methods=["POST"])
+def clear_cache():
+    cache_store.clear()
+    return jsonify({"message": "Cache cleared"})
+
+@app.route("/filters/options", methods=["GET"])
+@cache_response(timeout=1800)
+def get_filter_options():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT DISTINCT company FROM job_openings WHERE company IS NOT NULL ORDER BY company")
+    companies = [r[0] for r in cursor.fetchall()]
+    cursor.execute("SELECT DISTINCT location_scraped FROM job_openings WHERE location_scraped IS NOT NULL ORDER BY location_scraped")
+    locations = [r[0] for r in cursor.fetchall()]
+    cursor.execute("SELECT DISTINCT job_type FROM job_openings WHERE job_type IS NOT NULL ORDER BY job_type")
+    types = [r[0] for r in cursor.fetchall()]
+    conn.close()
+    return jsonify({"companies": companies, "locations": locations, "job_types": types})
+
+@app.route("/jobs/stats", methods=["GET"])
+@cache_response(timeout=900)
+def get_job_stats():
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("SELECT COUNT(*) as total FROM job_openings")
+    total = cursor.fetchone()['total']
+    cursor.execute("SELECT COUNT(*) as remote FROM job_openings WHERE is_remote = 1")
+    remote = cursor.fetchone()['remote']
+    conn.close()
+    return jsonify({"total_jobs": total, "remote_jobs": remote})
+
+@app.route("/jobs/suggest", methods=["GET"])
+def get_search_suggestions():
+    return jsonify({"suggestions": []})
+
 if __name__ == "__main__":
-    app.run(debug=True, port=5000) # We'll run this on port 5000
+    app.run(debug=True, port=5000)

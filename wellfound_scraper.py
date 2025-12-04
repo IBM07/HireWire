@@ -1,6 +1,8 @@
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 from bs4 import BeautifulSoup
 import time
 import mysql.connector
@@ -9,214 +11,203 @@ import re
 # Configuration constants
 WELLFOUND_URL = "https://wellfound.com/jobs"
 SCROLL_PAUSE_TIME = 2
-MAX_SCROLLS = 20  # Additional scrolls for Wellfound's slower loading
+MAX_SCROLLS = 20  
 
 def get_db_connection():
-    """Establish database connection for job storage"""
+    """Establish database connection with utf8mb4 support for emojis/special chars"""
     return mysql.connector.connect(
         host="127.0.0.1",
         user="root",
-        password="Ibrahim@321",
-        database="job_agent"
+        password="Ibrahim@321", # NOTE: Consider using environment variables for security later
+        database="job_agent",
+        charset='utf8mb4',
+        collation='utf8mb4_unicode_ci'
     )
 
 def clean_wellfound_text(raw_text):
     """
-    Remove Wellfound-specific navigation and UI elements from scraped text
-    Returns clean job description content
+    Clean whitespace without destroying sentence structure.
     """
-    # Wellfound page elements that aren't part of job descriptions
-    site_noise = [
-        "Wellfound",
-        "Overview",
-        "Jobs",
-        "About us",
-        "Reviews",
-        "Recommended for you",
-        "Apply now",
-        "Save",
-        "Share",
-        "Recruiters from this company",
-        "Browse by:",
-        "Hiring now",
-        "Login",
-        "Sign Up"
-    ]
+    if not raw_text:
+        return ""
     
-    cleaned_text = raw_text
-    for noise in site_noise:
-        cleaned_text = cleaned_text.replace(noise, " ")
+    # Replace multiple newlines/spaces with a single space
+    cleaned = " ".join(raw_text.split())
+    return cleaned
+
+def extract_meta_data(soup, page_title):
+    """
+    Helper to extract Company, Location and Remote status
+    """
+    company = "Unknown"
+    location = "Unknown"
+    is_remote = 0
     
-    # Normalize whitespace
-    return " ".join(cleaned_text.split())
+    # 1. Try to extract Company from Page Title (Format: "Role at Company - ...")
+    if " at " in page_title:
+        try:
+            parts = page_title.split(" at ")
+            if len(parts) > 1:
+                # Take the part after "at", and split by " - " or "|" if present
+                company_part = parts[1].split("-")[0].split("|")[0]
+                company = company_part.strip()
+        except:
+            pass
+
+    # 2. Extract Location & Remote status from text analysis
+    # (Since classes change, we scan the text for keywords)
+    full_text = soup.get_text().lower()
+    
+    if "remote" in full_text:
+        is_remote = 1
+        # If it's explicitly remote, we can set location to Remote
+        if location == "Unknown":
+            location = "Remote"
+            
+    return company, location, is_remote
 
 def scrape_wellfound():
-    """
-    Main function to scrape Wellfound job listings
-    Requires manual login due to anti-bot protections
-    """
     print("Starting Wellfound scraper...")
 
-    # Browser configuration with anti-detection measures
     options = Options()
     options.add_argument("--window-size=1920,1080")
     options.add_argument("--disable-blink-features=AutomationControlled")
     
     driver = webdriver.Chrome(options=options)
-    
-    # Manual login phase - Wellfound requires human interaction
+    wait = WebDriverWait(driver, 10) # 10 second timeout handler
+
+    # --- Login Phase ---
     driver.get("https://wellfound.com/login")
     print("\n" + "=" * 50)
     print("Manual login required:")
-    print("1. Log into Wellfound in the browser window")
-    print("2. Solve any CAPTCHA challenges")
-    print("3. Navigate to the Jobs page")
-    print("4. Press ENTER here when ready to continue")
+    print("1. Log into Wellfound")
+    print("2. Navigate to the Jobs page")
+    print("3. Press ENTER here when ready...")
     print("=" * 50 + "\n")
     input("Press ENTER to continue...")
 
-    # Reconnect to the active browser session after manual login
     try:
-        window_handles = driver.window_handles
-        if not window_handles:
-            print("Error: Browser window not available")
+        # Re-verify window handle
+        if not driver.window_handles:
+            print("Error: Browser closed.")
             return
-
-        # Switch to most recent window/tab
-        driver.switch_to.window(window_handles[-1])
-        print(f"Connected to browser window: {driver.title}")
-        
-    except Exception as connection_error:
-        print(f"Browser connection error: {connection_error}")
+        driver.switch_to.window(driver.window_handles[-1])
+    except Exception as e:
+        print(f"Connection error: {e}")
         return
 
-    # Scroll to load all available job listings
-    print("Loading job listings via scrolling...")
+    # --- Scrolling Phase ---
+    print("Loading jobs...")
     last_height = driver.execute_script("return document.body.scrollHeight")
     
-    for scroll_count in range(MAX_SCROLLS):
+    for i in range(MAX_SCROLLS):
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
         time.sleep(SCROLL_PAUSE_TIME)
         
-        new_height = driver.execute_script("return document.body.scrollHeight")
-        
-        # Check for and click "Show more" button if present
+        # Robust "Show More" clicking
         try:
-            show_more_button = driver.find_element(By.XPATH, "//button[contains(text(), 'Show more')]")
-            if show_more_button:
-                show_more_button.click()
+            # Look for button by distinct text or structure
+            show_more = driver.find_elements(By.XPATH, "//button[contains(text(), 'Show more') or contains(text(), 'Load more')]")
+            if show_more:
+                driver.execute_script("arguments[0].click();", show_more[0])
                 time.sleep(2)
-        except:
-            pass  # Button not found, continue with scrolling
+        except Exception:
+            pass
 
-        # Check if we've reached the bottom of the page
+        new_height = driver.execute_script("return document.body.scrollHeight")
         if new_height == last_height:
-            # Final scroll attempt to ensure all content is loaded
-            driver.execute_script("window.scrollTo(0, document.body.scrollHeight + 1000);")
-            time.sleep(2)
-            if driver.execute_script("return document.body.scrollHeight") == last_height:
-                print("All content loaded")
-                break
-        
+            break
         last_height = new_height
-        print(f"Scroll iteration {scroll_count + 1}/{MAX_SCROLLS}")
+        print(f"Scroll {i+1}/{MAX_SCROLLS}")
 
-    # Extract job links from the loaded page
-    print("Parsing job links from HTML...")
+    # --- Link Extraction ---
+    print("Parsing HTML...")
     soup = BeautifulSoup(driver.page_source, "html.parser")
-    
     job_links = []
     processed_urls = set()
     
-    # Target job roles to scrape
     target_roles = ["engineer", "developer", "backend", "frontend", "full stack", "python", "ai", "machine learning", "data"]
 
-    # Find and filter job links
     for link in soup.find_all('a', href=True):
         href = link.get('href')
+        if "/jobs/" not in href: continue
         
-        # Filter for job URLs (contain /jobs/ path)
-        if "/jobs/" not in href:
-            continue
-            
-        # Convert relative URLs to absolute
-        if href.startswith("http"):
-            full_url = href
-        else:
-            full_url = f"https://wellfound.com{href}"
-            
-        # Remove query parameters and check for duplicates
-        full_url = full_url.split('?')[0]
-        if full_url in processed_urls:
-            continue
+        full_url = f"https://wellfound.com{href}" if not href.startswith("http") else href.split('?')[0]
         
-        # Extract job title
+        if full_url in processed_urls: continue
+        
         title = link.get_text(strip=True)
-        if not title:
-            continue
+        if not title: continue
         
-        # Filter by target roles
-        title_lower = title.lower()
-        if not any(role in title_lower for role in target_roles):
-            continue
+        if any(role in title.lower() for role in target_roles):
+            processed_urls.add(full_url)
+            job_links.append((title, full_url))
 
-        processed_urls.add(full_url)
-        job_links.append((title, full_url))
+    print(f"Found {len(job_links)} target jobs.")
 
-    print(f"Found {len(job_links)} valid job listings")
-
-    # Process each job listing
+    # --- Detail Extraction & DB Save ---
     conn = get_db_connection()
     cursor = conn.cursor()
 
     for job_title, job_url in job_links:
-        print(f"Processing: {job_title[:40]}...")
+        print(f"Processing: {job_title[:30]}...")
         
         try:
-            # Navigate to individual job page
             driver.get(job_url)
-            time.sleep(3)  # Wait for React components to render
+            # Smart Wait: Wait until body text is present
+            wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+            time.sleep(1) # Small buffer for dynamic content
             
-            # Parse job description page
             desc_soup = BeautifulSoup(driver.page_source, "html.parser")
             
             if desc_soup.body:
-                # Extract and clean job description text
-                raw_text = desc_soup.body.get_text(separator=' ', strip=True)
+                # 1. Get Clean Description
+                # usage of separator=' ' ensures words don't merge (e.g. HeaderContent -> Header Content)
+                raw_text = desc_soup.body.get_text(separator=' ', strip=True) 
                 clean_text = clean_wellfound_text(raw_text)
                 
-                # Validate content length after cleaning
-                if len(clean_text) < 500:
-                    print("Content too short after cleaning - skipping")
+                if len(clean_text) < 100: # Lowered threshold to avoid skipping short valid listings
                     continue
 
-                # Save to database
+                # 2. Extract Metadata (Company, Location, Remote)
+                page_title = driver.title
+                company, location, is_remote = extract_meta_data(desc_soup, page_title)
+
+                # 3. Database Insert (Updated to match Schema)
                 try:
                     insert_query = """
                     INSERT INTO job_openings 
-                    (search_query, job_url, job_title, raw_description) 
-                    VALUES (%s, %s, %s, %s)
+                    (search_query, job_url, job_title, raw_description, company, location_scraped, is_remote) 
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
                     """
-                    values = ("Wellfound Scraper", job_url, job_title, clean_text)
+                    values = (
+                        "Wellfound Scraper", 
+                        job_url, 
+                        job_title, 
+                        clean_text, 
+                        company, 
+                        location, 
+                        is_remote
+                    )
                     cursor.execute(insert_query, values)
                     conn.commit()
-                    print("Successfully saved to database")
-                except mysql.connector.Error as db_error:
-                    if db_error.errno == 1062:  # Handle duplicate entries
-                        print("Duplicate entry - skipping")
+                    print(f"Saved: {job_title} at {company}")
+                    
+                except mysql.connector.Error as err:
+                    if err.errno == 1062:
+                        print("Skipping duplicate.")
                     else:
-                        print(f"Database error: {db_error}")
+                        print(f"DB Error: {err}")
             else:
-                print("No page content available")
+                print("Empty body content.")
 
-        except Exception as processing_error:
-            print(f"Error processing {job_url}: {processing_error}")
+        except Exception as e:
+            print(f"Failed to process {job_url}: {e}")
 
-    # Cleanup resources
     driver.quit()
     cursor.close()
     conn.close()
-    print("Wellfound scraping completed")
+    print("Scraping finished.")
 
 if __name__ == "__main__":
     scrape_wellfound()

@@ -1,122 +1,184 @@
-# --- 1. The Imports ---
-# 'streamlit' is the core library, we conventionall import it as 'st'.
-# 'requests' is the library we use to *call* our Flask API.
-# This frontend is "dumb" - it holds no logic, it just asks the backend.
 import streamlit as st
 import requests
+import os
+import PyPDF2  # You need to install this: pip install PyPDF2
 
-# --- 2. The "Interview" Critical Concept: Caching ---
-#
-# !! The Junior Mistake !!
-# Calling 'requests.get()' *directly* inside the 'if st.button' block.
-# Why? If the user interacts with *another* widget (imagine a slider),
-# the script reruns, and it would *call your API again* needlessly.
-#
-# THE SENIOR SOLUTION:
-# We wrap our API call in a Streamlit "cache" function.
-# '@st.cache_data' is a decorator that tells Streamlit:
-# "Before running this function, check if it has been run with these *exact
-# arguments* before. If yes, return the saved result immediately without
-# running the function."
-# This is your #1 performance tool.
-@st.cache_data  # <-- This is the magic decorator
+# --- 1. Configuration & Cloud Readiness ---
+# GCP requires dynamic configuration. We read from Environment Variables.
+# Locally, it defaults to localhost. On GCP, you set 'API_URL' in the dashboard.
+API_BASE_URL = os.getenv("API_URL", "http://127.0.0.1:5000")
+
+# --- 2. Caching & API Logic ---
+@st.cache_data(ttl=60) # Cache for 1 minute to prevent spamming
 def fetch_jobs_from_api(skills_query):
-    """
-    Calls our Flask API to get job data.
-    This function will only re-run if 'skills_query' changes.
-    """
     try:
-        # We call our Flask API, which is running on port 5000
-        api_url = "http://127.0.0.1:5000/jobs"
-        params = {"skills": skills_query}
+        # Construct endpoint using the dynamic base URL
+        api_url = f"{API_BASE_URL}/jobs"
+        params = {"skills": skills_query, "per_page": 50}
         
-        response = requests.get(api_url, params=params)
+        response = requests.get(api_url, params=params, timeout=10)
+        response.raise_for_status()
+        return response.json()
         
-        # Raise an error if the API call failed (e.g., 500 error)
-        response.raise_for_status() 
-        
-        return response.json()  # Return the clean JSON data
-        
-    except requests.exceptions.ConnectionError:
-        # This catches the error if 'api.py' isn't running
-        return {"error": "ConnectionError"}
-    except requests.exceptions.HTTPError as e:
-        # This catches errors from our API (like 500)
-        return {"error": f"HTTPError: {e}"}
+    except requests.exceptions.RequestException as e:
+        return {"error": str(e)}
 
-# --- 3. The Page Configuration ---
-# This MUST be the first Streamlit command you run.
-# It sets the browser tab title, icon, and layout.
-# 'layout="wide"' gives us more space to work with.
+def extract_text_from_pdf(pdf_file):
+    """Helper feature to read resumes"""
+    try:
+        pdf_reader = PyPDF2.PdfReader(pdf_file)
+        text = ""
+        for page in pdf_reader.pages:
+            text += page.extract_text()
+        return text
+    except Exception:
+        return ""
+
+# --- 3. Page Config ---
 st.set_page_config(
-    page_title="CareerCortex",
+    page_title="CareerCortex | AI Job Agent",
     page_icon="🚀",
     layout="wide"
 )
 
-# --- 4. The UI (The "Script" Part) ---
-# Streamlit runs this like a script. It just draws
-# components from top to bottom.
-st.title("🚀 CareerCortex")
-st.write("Enter your skills. Our AI will find the jobs that *actually* match.")
+# --- 4. Session State Setup ---
+# This ensures the input box updates automatically when a resume is uploaded
+if 'skills_input' not in st.session_state:
+    st.session_state.skills_input = "python, docker, fastapi"
 
-# 'st.text_input' creates a text box.
-# The variable 'user_skills' will hold whatever the user types.
+# --- 5. The UI ---
+st.title("🚀 CareerCortex")
+st.markdown("### The AI Agent that reads your resume and finds your job.")
+
+# --- FEATURE: Resume Uploader ---
+with st.expander("📄 Upload Resume (Optional) - Let AI extract your skills", expanded=True):
+    uploaded_file = st.file_uploader("Upload PDF Resume", type="pdf")
+    if uploaded_file:
+        resume_text = extract_text_from_pdf(uploaded_file)
+        if resume_text:
+            # Simple keyword extraction simulation
+            # In a real interview, you'd mention you could use an LLM here
+            found_skills = []
+            common_tech = [
+    # Core Languages
+    "python", "java", "c++", "go", "golang", "rust", "javascript", "typescript", "node.js",
+    
+    # Data Structures & Algorithms
+    "arrays", "linked lists", "binary trees", "avl trees", "b-trees", "graphs", 
+    "bfs", "dfs", "hash maps", "heaps", "sorting algorithms", "searching algorithms", "big o notation",
+    
+    # Object-Oriented Programming & Design
+    "inheritance", "polymorphism", "encapsulation", "abstraction", "solid principles",
+    "singleton pattern", "factory pattern", "observer pattern", "strategy pattern", 
+    "decorator pattern", "adapter pattern", "dependency injection",
+    
+    # Backend Frameworks
+    "django", "flask", "fastapi", "tornado", "sanic",
+    
+    # API Standards & Protocols
+    "restful apis", "hateoas", "graphql", "grpc", "protocol buffers", "websockets",
+    
+    # ORM & Data Validation
+    "sqlalchemy", "django orm", "pydantic", "alembic",
+    
+    # Databases (Relational & NoSQL)
+    "postgresql", "mysql", "mariadb", "sqlite", 
+    "mongodb", "cassandra", "scylladb", "dynamodb", "neo4j",
+    
+    # Caching & Search
+    "redis", "memcached", "elasticsearch", "solr", "meilisearch",
+    
+    # Async & Task Queues
+    "celery", "redis queue", "dramatiq", "asyncio",
+    
+    # Web Servers
+    "gunicorn", "uvicorn", "hypercorn", "wsgi", "asgi",
+    
+    # System Architecture
+    "monolithic architecture", "microservices", "event-driven architecture", "serverless", "soa",
+    "horizontal scaling", "vertical scaling", "load balancing", "nginx", "haproxy", "aws alb", 
+    "sharding", "consistent hashing", "cap theorem", "distributed systems", 
+    "consensus algorithms", "raft", "paxos", "distributed locking", "idempotency", 
+    "event sourcing", "cqrs",
+    
+    # Infrastructure & DevOps
+    "docker", "containerd", "kubernetes", "helm charts", "terraform", "ansible", "pulumi", "cloudformation",
+    
+    # Cloud Platforms (AWS/GCP/Azure)
+    "aws", "gcp", "azure", "ec2", "lambda", "eks", "ecs", "s3", "ebs", "glacier", 
+    "vpc", "route53", "cloudfront",
+    
+    # CI/CD
+    "github actions", "gitlab ci", "jenkins", "circleci", "argocd",
+    
+    # Testing
+    "pytest", "unittest", "selenium", "playwright", "postman", "newman", "mocking",
+    
+    # Tools & Observability
+    "git", "gitflow", "bash scripting", "zsh", "grep", "sed", "awk", "ssh", "curl", 
+    "prometheus", "grafana", "elk stack", "jaeger", "zipkin", "sentry",
+    
+    # Security
+    "owasp top 10", "oauth2", "jwt", "openid connect", "tls/ssl",
+    
+    # Data Engineering & AI Integration
+    "apache kafka", "rabbitmq", "airflow", "spark", "etl pipelines",
+    "langchain", "vector databases", "pinecone", "milvus", "openai api", "huggingface transformers"
+]
+            
+            for tech in common_tech:
+                if tech in resume_text.lower():
+                    found_skills.append(tech)
+            
+            if found_skills:
+                # Update the session state to auto-fill the input box
+                st.session_state.skills_input = ", ".join(found_skills)
+                st.success(f"✅ Extracted {len(found_skills)} skills from your resume!")
+            else:
+                st.warning("Could not identify specific tech skills, but file loaded.")
+
+# --- Main Search Input ---
+# We bind the value to session_state so the resume uploader can update it
 user_skills = st.text_input(
     "Your Skills",
-    "python, docker, fastapi",  # This is the default text
-    help="Enter your skills, comma-separated."
+    key="skills_input", # This links the input to our variable
+    help="Enter skills comma-separated, or upload resume above."
 )
 
-# 'st.button' creates a button.
-# The code *inside* this 'if' block only runs when the button is clicked.
-if st.button("Find My Match"):
-
-    # 4a. Input Validation:
+if st.button("Find My Match", type="primary"):
     if not user_skills:
-        st.error("Please enter at least one skill to start.")
+        st.error("Please enter skills or upload a resume.")
     else:
-        # 4b. Call our *cached* function
-        # 'st.spinner' shows a nice loading message
-        with st.spinner(f"Analyzing jobs for '{user_skills}'..."):
+        with st.spinner(f"Connecting to AI Agent at {API_BASE_URL}..."):
             data = fetch_jobs_from_api(user_skills)
 
-        # 4c. Handle API Errors:
         if "error" in data:
-            if data["error"] == "ConnectionError":
-                st.error("Fatal Error: Cannot connect to the backend API.")
-                st.info("Is your 'api.py' server running in a separate terminal?")
-            else:
-                st.error(f"An API error occurred: {data['error']}")
-        
-        # 4d. Display Results:
+            st.error(f"❌ Connection Failed: {data['error']}")
+            st.info("💡 If running locally, ensure backend is on port 5000.")
+            st.info("💡 If on GCP, ensure API_URL environment variable is set.")
         else:
+            # Handle Pagination Structure
+            total_count = data.get('pagination', {}).get('total_jobs', 0)
             jobs = data.get('jobs', [])
-            
+
             if not jobs:
-                st.warning("No jobs found matching your skills. Try being less specific.")
+                st.warning("No jobs found. Try broader keywords.")
             else:
-                st.success(f"Found {data['total']} matching jobs!")
+                st.success(f"🎯 Found {total_count} perfect matches based on your profile.")
                 
-                # Loop through the JSON results from our API
+                # Display Grid
                 for job in jobs:
-                    # 'st.container' creates a visual "card" for each job
-                    with st.container(border=True): 
-                        
-                        # 'st.columns' creates a grid. [3, 1] means the
-                        # first column is 3x wider than the second.
-                        col1, col2 = st.columns([3, 1])
-                        
-                        with col1:
-                            st.subheader(f"**{job['title']}**")
-                            st.caption(f"{job['company']}  •  {job['location']}  •  Remote: {'✅ Yes' if job['is_remote'] else '❌ No'}")
-                            
-                            if job['skills_missing']:
-                                # 'st.error' is a great way to highlight the "Skills Gap"
-                                st.error(f"**Skills Gap:** {', '.join(job['skills_missing'])}")
-                        
-                        with col2:
-                            # Use markdown to make the score big and bold
-                            st.markdown(f"### {job['match_score']}")
-                            # 'st.link_button' creates a real hyperlink
-                            st.link_button("Apply Now ↗", job['apply_url'])
+                    with st.container(border=True):
+                        c1, c2 = st.columns([3, 1])
+                        with c1:
+                            st.subheader(job['title'])
+                            st.caption(f"{job['company']} | {job['location']} | {'Remote 🌍' if job.get('is_remote') else 'On-site 🏢'}")
+                            if job.get('skills_missing'):
+                                st.markdown(f"⚠️ **Missing:** `{', '.join(job['skills_missing'][:5])}`")
+                        with c2:
+                            st.metric("Match Score", job['match_score'])
+                            st.link_button("Apply Now", job.get('apply_url', '#'))
+
+# --- Footer for Interview Credit ---
+st.markdown("---")
+st.caption("Powered by Custom Python Scraper, Flask API, and Streamlit Frontend.")

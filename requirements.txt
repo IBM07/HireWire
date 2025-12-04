@@ -8,3 +8,6 @@ ollama
 flask
 streamlit
 flask-cors
+pandas 
+plotly
+PyPDF2
